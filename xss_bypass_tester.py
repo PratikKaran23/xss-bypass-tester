@@ -88,6 +88,43 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_RATE_LIMIT = 0.5
 DEFAULT_WORKERS = 1
 
+# Auto-mode injection surface
+COMMON_PARAM_NAMES = [
+    "q", "search", "s", "query", "keyword", "term",
+    "id", "name", "user", "username", "email",
+    "page", "view", "tab", "section",
+    "redirect", "url", "next", "return", "returnUrl", "returnTo",
+    "callback", "jsonp", "cb",
+    "lang", "locale",
+    "file", "path", "dir", "src", "dest",
+    "ref", "referrer", "from",
+    "data", "text", "msg", "message", "comment",
+    "error", "err", "info", "warning",
+    "input", "value", "v",
+    "title", "desc", "description",
+]
+
+COMMON_HEADERS_TO_TEST = [
+    "Referer",
+    "User-Agent",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Original-URL",
+    "X-Rewrite-URL",
+    "X-Real-IP",
+    "X-Forwarded-Proto",
+    "X-Host",
+    "X-Custom-Header",
+    "X-Api-Version",
+]
+
+# In auto mode we trim the Accept fan-out to keep request volume sane.
+AUTO_ACCEPT_VARIANTS = [
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "text/html",
+    "*/*",
+]
+
 
 # ----------------------------------------------------------------------------
 # Payload library
@@ -446,6 +483,220 @@ def analyze_response(resp: requests.Response, payload: str) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------
+# Auto-discovery — generate candidate injection vectors and probe for reflection
+# ----------------------------------------------------------------------------
+
+def _replace_url(req: dict[str, Any], new_url: str) -> dict[str, Any]:
+    return {**req, "url": new_url, "headers": dict(req["headers"])}
+
+
+def _with_header(req: dict[str, Any], name: str, value: str) -> dict[str, Any]:
+    h = dict(req["headers"])
+    h[name] = value
+    return {**req, "headers": h}
+
+
+def auto_expand(base_req: dict[str, Any], auth_cookie: str | None) -> list[tuple[str, dict[str, Any]]]:
+    """Return list of (label, req_with_marker_placed) for every candidate
+    injection point — existing query params, common test params, path,
+    common headers, and cookies."""
+    vectors: list[tuple[str, dict[str, Any]]] = []
+    parsed = urllib.parse.urlparse(base_req["url"])
+    existing_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+
+    headers = dict(base_req["headers"])
+    headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/120.0 XSS-Bypass-Tester",
+    )
+    if auth_cookie:
+        existing_cookie = headers.get("Cookie", "")
+        headers["Cookie"] = (existing_cookie + "; " + auth_cookie).strip("; ") if existing_cookie else auth_cookie
+    req_base = {**base_req, "headers": headers}
+
+    # 1. Existing query params — inject one at a time
+    existing_names = {k for k, _ in existing_params}
+    for i, (k, _v) in enumerate(existing_params):
+        new_params = list(existing_params)
+        new_params[i] = (k, INJECT_MARKER)
+        new_query = urllib.parse.urlencode(new_params, safe="")
+        vectors.append((f"query:{k}", _replace_url(req_base, parsed._replace(query=new_query).geturl())))
+
+    # 2. Common test params
+    for name in COMMON_PARAM_NAMES:
+        if name in existing_names:
+            continue
+        new_params = list(existing_params) + [(name, INJECT_MARKER)]
+        new_query = urllib.parse.urlencode(new_params, safe="")
+        vectors.append((f"query:+{name}", _replace_url(req_base, parsed._replace(query=new_query).geturl())))
+
+    # 3. Path segments
+    path = parsed.path or "/"
+    path_no_slash = path.rstrip("/")
+    if path_no_slash and path_no_slash != "":
+        segs = path_no_slash.split("/")
+        # Replace last segment
+        new_segs = segs[:-1] + [INJECT_MARKER]
+        new_path = "/".join(new_segs)
+        vectors.append((
+            "path:last_segment",
+            _replace_url(req_base, parsed._replace(path=new_path).geturl()),
+        ))
+    # Append a new segment
+    sep = "" if path.endswith("/") else "/"
+    new_path = path + sep + INJECT_MARKER
+    vectors.append((
+        "path:appended",
+        _replace_url(req_base, parsed._replace(path=new_path).geturl()),
+    ))
+
+    # 4. Common headers
+    for h in COMMON_HEADERS_TO_TEST:
+        vectors.append((f"header:{h}", _with_header(req_base, h, INJECT_MARKER)))
+
+    # 5. Cookies — if the user provided auth cookies, inject into each named
+    #    value too; otherwise add a generic probe cookie.
+    cookie_header = headers.get("Cookie", "")
+    if cookie_header:
+        parts = [p.strip() for p in cookie_header.split(";") if p.strip()]
+        for i, p in enumerate(parts):
+            if "=" in p:
+                name = p.split("=", 1)[0].strip()
+                new_parts = list(parts)
+                new_parts[i] = f"{name}={INJECT_MARKER}"
+                vectors.append((f"cookie:{name}", _with_header(req_base, "Cookie", "; ".join(new_parts))))
+    else:
+        vectors.append(("cookie:probe", _with_header(req_base, "Cookie", f"probe={INJECT_MARKER}")))
+
+    # 6. Body injection if request has a body — try replacing the body value
+    if base_req["body"]:
+        try:
+            parsed_body = json.loads(base_req["body"])
+            if isinstance(parsed_body, dict):
+                for k in list(parsed_body.keys()):
+                    new_body = dict(parsed_body)
+                    new_body[k] = INJECT_MARKER
+                    vectors.append((
+                        f"body:json:{k}",
+                        {**req_base, "body": json.dumps(new_body)},
+                    ))
+        except (json.JSONDecodeError, ValueError):
+            # Form-encoded?
+            if "=" in base_req["body"] and "&" in base_req["body"]:
+                form_pairs = urllib.parse.parse_qsl(base_req["body"], keep_blank_values=True)
+                for i, (k, _) in enumerate(form_pairs):
+                    new_pairs = list(form_pairs)
+                    new_pairs[i] = (k, INJECT_MARKER)
+                    vectors.append((
+                        f"body:form:{k}",
+                        {**req_base, "body": urllib.parse.urlencode(new_pairs, safe="")},
+                    ))
+
+    return vectors
+
+
+def discover_reflecting_vectors(
+    session: requests.Session,
+    vectors: list[tuple[str, dict[str, Any]]],
+    timeout: int,
+    rate_limit: float,
+    max_vectors: int,
+    progress: bool = True,
+) -> list[dict[str, Any]]:
+    """Probe each vector with REFLECT_TOKEN; return those whose response
+    body contains the token (and so are reflection candidates)."""
+    reflecting: list[dict[str, Any]] = []
+    total = len(vectors)
+    for idx, (label, req) in enumerate(vectors, 1):
+        probed = apply_payload(req, REFLECT_TOKEN)
+        try:
+            resp = session.request(
+                method=probed["method"],
+                url=probed["url"],
+                headers=probed["headers"],
+                data=probed["body"].encode("utf-8", errors="replace") if probed["body"] else None,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+            text = resp.text or ""
+            ctype = resp.headers.get("Content-Type", "<missing>")
+            reflected = REFLECT_TOKEN in text
+            if progress:
+                marker = "[+]" if reflected else "[ ]"
+                print(f"{marker} probe {idx}/{total} {label:30s} status={resp.status_code} ctype={ctype[:40]}",
+                      file=sys.stderr)
+            if reflected:
+                reflecting.append({
+                    "label": label,
+                    "req": req,
+                    "status": resp.status_code,
+                    "content_type": ctype,
+                })
+        except requests.RequestException as e:
+            if progress:
+                print(f"[!] probe {idx}/{total} {label}: {e}", file=sys.stderr)
+        if rate_limit > 0:
+            time.sleep(rate_limit)
+    # Cap to most promising — prefer HTML content types
+    reflecting.sort(key=lambda r: ("text/html" not in r["content_type"].lower(), r["label"]))
+    return reflecting[:max_vectors]
+
+
+DOM_SINKS = {
+    "innerHTML": r"\.innerHTML\s*=",
+    "outerHTML": r"\.outerHTML\s*=",
+    "document.write": r"document\.write(?:ln)?\s*\(",
+    "eval": r"\beval\s*\(",
+    "setTimeout_string": r"setTimeout\s*\(\s*[\"']",
+    "setInterval_string": r"setInterval\s*\(\s*[\"']",
+    "Function_constructor": r"\bnew\s+Function\s*\(",
+    "insertAdjacentHTML": r"\.insertAdjacentHTML\s*\(",
+    "location_assign": r"location\s*\.\s*(?:href|replace|assign)\s*=",
+    "jQuery_html": r"\$\([^)]*\)\.html\s*\(",
+    "jQuery_append": r"\$\([^)]*\)\.append\s*\(",
+}
+
+DOM_SOURCES = {
+    "location.hash": r"location\s*\.\s*hash",
+    "location.search": r"location\s*\.\s*search",
+    "location.href": r"location\s*\.\s*href",
+    "document.URL": r"document\s*\.\s*URL",
+    "document.referrer": r"document\s*\.\s*referrer",
+    "document.cookie": r"document\s*\.\s*cookie",
+    "window.name": r"window\s*\.\s*name",
+    "postMessage": r"addEventListener\s*\(\s*[\"']message[\"']",
+}
+
+
+def static_dom_scan(session: requests.Session, url: str, timeout: int) -> dict[str, Any]:
+    """Fetch URL, scan the response body for DOM XSS sinks/sources patterns."""
+    try:
+        resp = session.get(url, timeout=timeout, allow_redirects=False)
+    except requests.RequestException as e:
+        return {"error": str(e)}
+    body = resp.text or ""
+    sinks_found: dict[str, int] = {}
+    for name, pattern in DOM_SINKS.items():
+        m = re.findall(pattern, body, re.IGNORECASE)
+        if m:
+            sinks_found[name] = len(m)
+    sources_found: dict[str, int] = {}
+    for name, pattern in DOM_SOURCES.items():
+        m = re.findall(pattern, body, re.IGNORECASE)
+        if m:
+            sources_found[name] = len(m)
+    return {
+        "url": url,
+        "status": resp.status_code,
+        "content_type": resp.headers.get("Content-Type", "<missing>"),
+        "body_length": len(body),
+        "sinks_found": sinks_found,
+        "sources_found": sources_found,
+        "potential_dom_xss": bool(sinks_found and sources_found),
+    }
+
+
+# ----------------------------------------------------------------------------
 # Test executor
 # ----------------------------------------------------------------------------
 
@@ -457,15 +708,19 @@ class TestCase:
     accept: str
 
 
-def build_test_cases(categories: list[str] | None = None) -> list[TestCase]:
+def build_test_cases(
+    categories: list[str] | None = None,
+    accept_variants: list[str] | None = None,
+) -> list[TestCase]:
     cases: list[TestCase] = []
     cats = categories if categories else list(PAYLOADS.keys())
+    accepts = accept_variants if accept_variants is not None else ACCEPT_VARIANTS
     for cat in cats:
         if cat not in PAYLOADS:
             print(f"Unknown category: {cat} (skipped)", file=sys.stderr)
             continue
         for i, payload in enumerate(PAYLOADS[cat]):
-            for accept in ACCEPT_VARIANTS:
+            for accept in accepts:
                 cases.append(TestCase(
                     name=f"{cat}#{i}|accept:{accept[:30]}",
                     category=cat,
@@ -650,6 +905,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g_inline.add_argument("-H", "--header", action="append", default=[],
                           help="Header 'Name: value'. Repeat for multiple. Use the marker in any value.")
     g_inline.add_argument("-b", "--body", default="", help="Request body. May contain the marker.")
+    g_inline.add_argument("--cookie", default=None,
+                          help="Auth cookie(s) to attach in auto mode, e.g. 'sess=abc; auth=xyz'. "
+                               "Each named value is also added as an injection vector.")
+
+    g_auto = p.add_argument_group("auto mode")
+    g_auto.add_argument("--auto", action="store_true",
+                        help="Force auto-discovery even if a marker is present. "
+                             "Auto-discovery probes common params/headers/cookies/path for reflection, "
+                             "then fuzzes only the reflecting ones. Enabled automatically when no marker is found.")
+    g_auto.add_argument("--max-vectors", type=int, default=5,
+                        help="Cap on how many reflecting injection points to fuzz (default 5).")
+    g_auto.add_argument("--probe-only", action="store_true",
+                        help="Auto mode: stop after reflection-probe + DOM scan; do not run the payload battery.")
+    g_auto.add_argument("--auto-accept-only", action="store_true",
+                        help="In auto mode, use the 3-Accept trimmed variant list (faster, default). "
+                             "Pass --full-accept to use all 6.")
+    g_auto.add_argument("--full-accept", action="store_true",
+                        help="Use all 6 Accept-header variants per payload, even in auto mode.")
 
     g_raw = p.add_argument_group("raw request options")
     g_raw.add_argument("--scheme", default="https", choices=["http", "https"],
@@ -711,35 +984,109 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     points = find_injection_points(base_req)
-    if not points:
-        print(
-            f"No injection marker '{INJECT_MARKER}' found in URL/headers/body. "
-            "Nothing to test.",
-            file=sys.stderr,
+    auto_mode = args.auto or not points
+    # Auto mode trims the Accept fan-out by default (more vectors → more requests).
+    # Manual mode uses the full set unless the user explicitly trimmed.
+    if args.full_accept:
+        accept_variants = ACCEPT_VARIANTS
+    elif auto_mode:
+        accept_variants = AUTO_ACCEPT_VARIANTS
+    else:
+        accept_variants = ACCEPT_VARIANTS
+
+    session = make_session(verify_tls=not args.no_verify)
+
+    dom_report: dict[str, Any] | None = None
+    discovery: list[dict[str, Any]] = []
+    all_results: list[dict[str, Any]] = []
+
+    if auto_mode:
+        print("=" * 64, file=sys.stderr)
+        print("Auto mode — no marker provided (or --auto forced).", file=sys.stderr)
+        print("=" * 64, file=sys.stderr)
+
+        # Stage 1: static DOM-sink scan on baseline GET
+        print("[1/3] Static DOM-sink scan...", file=sys.stderr)
+        dom_report = static_dom_scan(session, base_req["url"], args.timeout)
+        if dom_report.get("error"):
+            print(f"     baseline fetch error: {dom_report['error']}", file=sys.stderr)
+        else:
+            print(f"     status={dom_report['status']}  ctype={dom_report['content_type']}  body={dom_report['body_length']} bytes",
+                  file=sys.stderr)
+            print(f"     sinks   : {dom_report['sinks_found'] or '(none)'}", file=sys.stderr)
+            print(f"     sources : {dom_report['sources_found'] or '(none)'}", file=sys.stderr)
+            if dom_report["potential_dom_xss"]:
+                print("     [!] Potential DOM XSS — sinks AND sources both present. Inspect JS sources.",
+                      file=sys.stderr)
+
+        # Stage 2: expand candidate injection points and probe for reflection
+        vectors = auto_expand(base_req, args.cookie)
+        print(f"\n[2/3] Probing {len(vectors)} candidate injection points for reflection...",
+              file=sys.stderr)
+        if args.dry_run:
+            print("(dry-run) Skipping probe.", file=sys.stderr)
+            discovery = []
+        else:
+            discovery = discover_reflecting_vectors(
+                session=session,
+                vectors=vectors,
+                timeout=args.timeout,
+                rate_limit=args.rate_limit,
+                max_vectors=args.max_vectors,
+                progress=not args.quiet,
+            )
+            print(f"\n     {len(discovery)} reflecting vector(s) selected for fuzzing (cap={args.max_vectors}).",
+                  file=sys.stderr)
+
+        if args.probe_only:
+            print("\n--probe-only set; stopping after discovery.", file=sys.stderr)
+        else:
+            # Stage 3: fuzz each reflecting vector with the full payload battery
+            if not discovery:
+                print("\n[3/3] No reflecting vectors found.", file=sys.stderr)
+                print("       Try --cookie '<auth>' if the page requires login,", file=sys.stderr)
+                print("       or supply a raw request with --raw and mark §INJECT§ manually.", file=sys.stderr)
+            else:
+                cases = build_test_cases(args.categories, accept_variants=accept_variants)
+                print(f"\n[3/3] Fuzzing {len(discovery)} vector(s) with {len(cases)} test cases each "
+                      f"({len(cases) * len(discovery)} requests total).", file=sys.stderr)
+                for v_idx, ref in enumerate(discovery, 1):
+                    label = ref["label"]
+                    print(f"\n  >>> Vector {v_idx}/{len(discovery)}: {label}", file=sys.stderr)
+                    results = run(
+                        base_req=ref["req"],
+                        cases=cases,
+                        workers=args.workers,
+                        rate_limit=args.rate_limit,
+                        timeout=args.timeout,
+                        verify_tls=not args.no_verify,
+                        dry_run=args.dry_run,
+                        progress=not args.quiet,
+                    )
+                    for r in results:
+                        r["injection_point"] = label
+                    all_results.extend(results)
+    else:
+        # Manual mode — marker present, single injection point
+        print(f"Injection points: {[p[0] for p in points]}", file=sys.stderr)
+        cases = build_test_cases(args.categories, accept_variants=accept_variants)
+        print(f"Test cases: {len(cases)}", file=sys.stderr)
+        if args.dry_run:
+            print("Dry-run mode — no requests will be sent.", file=sys.stderr)
+        all_results = run(
+            base_req=base_req,
+            cases=cases,
+            workers=args.workers,
+            rate_limit=args.rate_limit,
+            timeout=args.timeout,
+            verify_tls=not args.no_verify,
+            dry_run=args.dry_run,
+            progress=not args.quiet,
         )
-        return 2
-    print(f"Injection points: {[p[0] for p in points]}", file=sys.stderr)
-
-    cases = build_test_cases(args.categories)
-    print(f"Test cases: {len(cases)} ({len(PAYLOADS) if not args.categories else len(args.categories)} categories x payloads x {len(ACCEPT_VARIANTS)} Accept variants)", file=sys.stderr)
-
-    if args.dry_run:
-        print("Dry-run mode — no requests will be sent.", file=sys.stderr)
-
-    results = run(
-        base_req=base_req,
-        cases=cases,
-        workers=args.workers,
-        rate_limit=args.rate_limit,
-        timeout=args.timeout,
-        verify_tls=not args.no_verify,
-        dry_run=args.dry_run,
-        progress=not args.quiet,
-    )
 
     summary: dict[str, Any] | None = None
-    if not args.dry_run:
-        summary = summarize(results)
+    if not args.dry_run and all_results:
+        summary = summarize(all_results)
         print_summary(summary)
 
     if args.output:
@@ -750,8 +1097,16 @@ def main(argv: list[str] | None = None) -> int:
                 "headers": base_req["headers"],
                 "body": base_req["body"],
             },
-            "results": results,
+            "mode": "auto" if auto_mode else "manual",
+            "results": all_results,
         }
+        if dom_report is not None:
+            out["dom_scan"] = dom_report
+        if discovery:
+            out["discovery"] = [
+                {"label": d["label"], "status": d["status"], "content_type": d["content_type"]}
+                for d in discovery
+            ]
         if summary is not None:
             out["summary"] = summary
         args.output.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
