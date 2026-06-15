@@ -595,6 +595,32 @@ def auto_expand(base_req: dict[str, Any], auth_cookie: str | None) -> list[tuple
     return vectors
 
 
+class FatalProbeError(RuntimeError):
+    """Raised to bail out of probe phase early when every request will fail
+    the same way (e.g. TLS cert verification, name resolution)."""
+
+
+def _looks_like_cert_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "certificate verify failed",
+        "ssl: certificate",
+        "sslcertverificationerror",
+        "self signed certificate",
+        "self-signed certificate",
+    ))
+
+
+def _looks_like_dns_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "name or service not known",
+        "nodename nor servname",
+        "getaddrinfo failed",
+        "name resolution",
+    ))
+
+
 def discover_reflecting_vectors(
     session: requests.Session,
     vectors: list[tuple[str, dict[str, Any]]],
@@ -607,6 +633,7 @@ def discover_reflecting_vectors(
     body contains the token (and so are reflection candidates)."""
     reflecting: list[dict[str, Any]] = []
     total = len(vectors)
+    consecutive_errors = 0
     for idx, (label, req) in enumerate(vectors, 1):
         probed = apply_payload(req, REFLECT_TOKEN)
         try:
@@ -618,6 +645,7 @@ def discover_reflecting_vectors(
                 timeout=timeout,
                 allow_redirects=False,
             )
+            consecutive_errors = 0
             text = resp.text or ""
             ctype = resp.headers.get("Content-Type", "<missing>")
             reflected = REFLECT_TOKEN in text
@@ -633,6 +661,22 @@ def discover_reflecting_vectors(
                     "content_type": ctype,
                 })
         except requests.RequestException as e:
+            consecutive_errors += 1
+            # On the very first error, if it's a fatal class (TLS cert, DNS),
+            # bail out rather than spam 60+ identical errors.
+            if idx == 1 or consecutive_errors >= 3:
+                if _looks_like_cert_error(e):
+                    raise FatalProbeError(
+                        "TLS certificate verification failed. The target's cert is not "
+                        "trusted by your system's CA store.\n"
+                        "    Re-run with --no-verify to skip TLS verification (typical for "
+                        "internal/staging targets with self-signed or internal-CA certs)."
+                    ) from e
+                if _looks_like_dns_error(e):
+                    raise FatalProbeError(
+                        f"DNS resolution failed for the target host. Check the URL or "
+                        f"your connection.\n    Error: {e}"
+                    ) from e
             if progress:
                 print(f"[!] probe {idx}/{total} {label}: {e}", file=sys.stderr)
         if rate_limit > 0:
@@ -673,6 +717,15 @@ def static_dom_scan(session: requests.Session, url: str, timeout: int) -> dict[s
     try:
         resp = session.get(url, timeout=timeout, allow_redirects=False)
     except requests.RequestException as e:
+        if _looks_like_cert_error(e):
+            raise FatalProbeError(
+                "TLS certificate verification failed on baseline fetch. "
+                "Re-run with --no-verify to skip TLS verification."
+            ) from e
+        if _looks_like_dns_error(e):
+            raise FatalProbeError(
+                f"DNS resolution failed on baseline fetch.\n    Error: {e}"
+            ) from e
         return {"error": str(e)}
     body = resp.text or ""
     sinks_found: dict[str, int] = {}
@@ -1005,38 +1058,42 @@ def main(argv: list[str] | None = None) -> int:
         print("Auto mode — no marker provided (or --auto forced).", file=sys.stderr)
         print("=" * 64, file=sys.stderr)
 
-        # Stage 1: static DOM-sink scan on baseline GET
-        print("[1/3] Static DOM-sink scan...", file=sys.stderr)
-        dom_report = static_dom_scan(session, base_req["url"], args.timeout)
-        if dom_report.get("error"):
-            print(f"     baseline fetch error: {dom_report['error']}", file=sys.stderr)
-        else:
-            print(f"     status={dom_report['status']}  ctype={dom_report['content_type']}  body={dom_report['body_length']} bytes",
-                  file=sys.stderr)
-            print(f"     sinks   : {dom_report['sinks_found'] or '(none)'}", file=sys.stderr)
-            print(f"     sources : {dom_report['sources_found'] or '(none)'}", file=sys.stderr)
-            if dom_report["potential_dom_xss"]:
-                print("     [!] Potential DOM XSS — sinks AND sources both present. Inspect JS sources.",
+        try:
+            # Stage 1: static DOM-sink scan on baseline GET
+            print("[1/3] Static DOM-sink scan...", file=sys.stderr)
+            dom_report = static_dom_scan(session, base_req["url"], args.timeout)
+            if dom_report.get("error"):
+                print(f"     baseline fetch error: {dom_report['error']}", file=sys.stderr)
+            else:
+                print(f"     status={dom_report['status']}  ctype={dom_report['content_type']}  body={dom_report['body_length']} bytes",
                       file=sys.stderr)
+                print(f"     sinks   : {dom_report['sinks_found'] or '(none)'}", file=sys.stderr)
+                print(f"     sources : {dom_report['sources_found'] or '(none)'}", file=sys.stderr)
+                if dom_report["potential_dom_xss"]:
+                    print("     [!] Potential DOM XSS — sinks AND sources both present. Inspect JS sources.",
+                          file=sys.stderr)
 
-        # Stage 2: expand candidate injection points and probe for reflection
-        vectors = auto_expand(base_req, args.cookie)
-        print(f"\n[2/3] Probing {len(vectors)} candidate injection points for reflection...",
-              file=sys.stderr)
-        if args.dry_run:
-            print("(dry-run) Skipping probe.", file=sys.stderr)
-            discovery = []
-        else:
-            discovery = discover_reflecting_vectors(
-                session=session,
-                vectors=vectors,
-                timeout=args.timeout,
-                rate_limit=args.rate_limit,
-                max_vectors=args.max_vectors,
-                progress=not args.quiet,
-            )
-            print(f"\n     {len(discovery)} reflecting vector(s) selected for fuzzing (cap={args.max_vectors}).",
+            # Stage 2: expand candidate injection points and probe for reflection
+            vectors = auto_expand(base_req, args.cookie)
+            print(f"\n[2/3] Probing {len(vectors)} candidate injection points for reflection...",
                   file=sys.stderr)
+            if args.dry_run:
+                print("(dry-run) Skipping probe.", file=sys.stderr)
+                discovery = []
+            else:
+                discovery = discover_reflecting_vectors(
+                    session=session,
+                    vectors=vectors,
+                    timeout=args.timeout,
+                    rate_limit=args.rate_limit,
+                    max_vectors=args.max_vectors,
+                    progress=not args.quiet,
+                )
+                print(f"\n     {len(discovery)} reflecting vector(s) selected for fuzzing (cap={args.max_vectors}).",
+                      file=sys.stderr)
+        except FatalProbeError as e:
+            print(f"\n[FATAL] {e}", file=sys.stderr)
+            return 3
 
         if args.probe_only:
             print("\n--probe-only set; stopping after discovery.", file=sys.stderr)
